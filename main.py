@@ -40,7 +40,7 @@ COMPANY_LIST = [
     "DBS Bank","DBS","Standard Chartered Bank","SCB","HSBC","Bank of China",
     "OMNIA","EVONIK"
 ]
-FUZZY_CUTOFF = 80  # 0..100
+FUZZY_CUTOFF = 88  # 0..100
 
 def extract_company_fuzzy_multi(text: str, companies=COMPANY_LIST, cutoff=FUZZY_CUTOFF, limit=5) -> List[dict]:
     matches = process.extract(text, companies, scorer=fuzz.WRatio, limit=limit)
@@ -252,3 +252,4 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
         "retrieval_present": retrieval_present,
         "raw_status": resp.status_code
     }
+
