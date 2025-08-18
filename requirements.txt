@@ -9,3 +9,4 @@ redis
 langchain-core
 langchain-openai
 langchain-community
+upstash_redis
