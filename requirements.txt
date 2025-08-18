@@ -5,3 +5,7 @@ python-dotenv
 pydantic
 rapidfuzz
 openai>=1.0.0
+redis
+langchain-core
+langchain-openai
+langchain-community

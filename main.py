@@ -1,6 +1,6 @@
 import os, json, datetime as dt
 from typing import Optional, List
-
+import requests
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,9 +8,12 @@ from pydantic import BaseModel
 from rapidfuzz import process, fuzz
 from dotenv import load_dotenv
 from pathlib import Path
+from upstash_redis import Redis
 
 # Optional LLM fallback
 from openai import OpenAI
+from memory import get_session, append_turn, maybe_refresh_summary
+from langchain_core.messages import HumanMessage, AIMessage
 
 load_dotenv()
 
@@ -27,6 +30,13 @@ USE_LLM_NER = bool(OPENAI_API_KEY)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")  # can be negative for groups
 
+# Redis for session memory
+REDIS_URL = os.getenv("REDIS_URL", "")
+USE_REDIS = bool(REDIS_URL)
+# Upstash Redis REST API
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+
 # ---------- Clients ----------
 http_client = httpx.Client(verify=VERIFY_TLS, timeout=60)
 llm = OpenAI(api_key=OPENAI_API_KEY) if USE_LLM_NER else None
@@ -40,7 +50,12 @@ COMPANY_LIST = [
     "DBS Bank","DBS","Standard Chartered Bank","SCB","HSBC","Bank of China",
     "OMNIA","EVONIK"
 ]
-FUZZY_CUTOFF = 88  # 0..100
+FUZZY_CUTOFF = 80  # 0..100
+
+MEMORY_HEADER = (
+    "You are continuing an ongoing conversation. Use SUMMARY and RECENT to stay consistent and avoid repeating.\n"
+    "SUMMARY:\n{summary}\n\nRECENT:\n{recent}\n\n"
+)
 
 def extract_company_fuzzy_multi(text: str, companies=COMPANY_LIST, cutoff=FUZZY_CUTOFF, limit=5) -> List[dict]:
     matches = process.extract(text, companies, scorer=fuzz.WRatio, limit=limit)
@@ -151,7 +166,25 @@ def send_telegram_alert(payload: dict):
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
             print("Failed to send Telegram alert:", log_entry)
+            
+def _format_recent(history: list, n:int=8) -> str:
+    lines=[]
+    for m in history[-n:]:
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        lines.append(f"{role}: {m.content}")
+    return "\n".join(lines) if lines else "(none)"
 
+
+def _append_prompt_for_companies(orig: str, companies: List[dict]) -> str:
+    return (
+        orig
+        + "\n\n(1) Appreciate the user first."
+        + "\n(2) Avoid negative phrases like 'I am not sure' or 'I cannot help you'."
+        + "\n(3) Briefly tailor the response for these companies: "
+        + ", ".join([f"{c['name']} ({c['confidence']:.2f})" for c in companies])
+        + "\n(4) Show genuine interest in collaborating with these companies."
+    )
+    
 # ---------- FastAPI ----------
 app = FastAPI(title="Virtual Kevin – DO Agent Proxy (Hybrid detection + Telegram alerts)")
 
@@ -178,16 +211,27 @@ def health():
         "llm_ner_enabled": USE_LLM_NER,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
     }
+    
+    
+@app.get("/redis-ping-rest")
+def redis_ping_rest():
+    try:
+        if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+            return {"ok": False, "error": "REST URL/TOKEN not set"}
 
-def _append_prompt_for_companies(orig: str, companies: List[dict]) -> str:
-    return (
-        orig
-        + "\n\n(1) Appreciate the user first."
-        + "\n(2) Avoid negative phrases like 'I am not sure' or 'I cannot help you'."
-        + "\n(3) Briefly tailor the response for these companies: "
-        + ", ".join([f"{c['name']} ({c['confidence']:.2f})" for c in companies])
-        + "\n(4) Show genuine interest in collaborating with these companies."
-    )
+        resp = requests.get(
+            f"{UPSTASH_REDIS_REST_URL}/ping",
+            headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+            verify=False   # ⚠️ disables SSL check (only for testing!)
+        )
+
+        # Upstash returns JSON like {"result":"PONG"}
+        data = resp.json()
+        pong = (str(data.get("result", "")).upper() == "PONG")
+
+        return {"ok": pong, "raw": data, "status": resp.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/chat")
 def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
@@ -218,6 +262,17 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
         # Optional: nudge downstream answer
         body.message = _append_prompt_for_companies(body.message, companies)
 
+    
+    # ---- Memory load & augment message ----
+    session_id = body.session_id or "anon"
+    sess = get_session(session_id)
+    summary = maybe_refresh_summary(session_id) or "(none)"
+    recent = _format_recent(sess["history"])
+    memory_block = MEMORY_HEADER.format(summary=summary, recent=recent)
+
+    augmented_user_msg = memory_block + "\n" + body.message
+    
+    
     # 3) forward to DO agent
     url = f"{DO_AGENT_BASE}/chat/completions"
     headers = {
@@ -225,7 +280,7 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
         "Content-Type": "application/json",
     }
     payload = {
-        "messages": [{"role":"user","content": body.message}],
+        "messages": [{"role":"user","content": augmented_user_msg}],
         "stream": False,
         "include_retrieval_info": True
     }
@@ -244,6 +299,9 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
             retrieval_present = bool((data.get("retrieval") or {}).get("contexts"))
         except Exception:
             pass
+        
+    # ---- Save turn to memory ----
+    append_turn(session_id, body.message, answer if answer else None)
 
     return {
         "session_id": body.session_id,
@@ -252,4 +310,3 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
         "retrieval_present": retrieval_present,
         "raw_status": resp.status_code
     }
-
