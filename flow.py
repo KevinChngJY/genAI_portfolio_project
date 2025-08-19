@@ -24,7 +24,7 @@ def start_node(state: FlowState) -> FlowState:
     """First touch: greet + clarify intent, tailored to role."""
     if state.get("role") == "recruiter_interviewer":
         state.setdefault("messages", []).append(
-            "Hi! I’ll keep it crisp for recruiting. May I confirm the target role/team and timeline?"
+            "Hi! I’ll keep it crisp for recruiting. May I confirm the target role?"
         )
     else:
         state.setdefault("messages", []).append(
@@ -81,7 +81,7 @@ def cta_node(state: FlowState) -> FlowState:
     """Close with a clear call-to-action for recruiters/general."""
     if state.get("role") == "recruiter_interviewer":
         state.setdefault("messages", []).append(
-            "Would you like a short call or a tailored resume for the role? I can also share availability and notice period."
+            "Would you like a short call or a tailored resume for the role?"
         )
     else:
         state.setdefault("messages", []).append(

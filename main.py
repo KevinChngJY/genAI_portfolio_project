@@ -74,7 +74,8 @@ def extract_company_llm(text: str) -> List[dict]:
         model="gpt-4o-mini",
         messages=[
             {"role":"system","content":
-             "Extract organisation/company names mentioned by the user. "
+             "Extract organisation/company names mentioned by the user. \n"
+             "Make sure that it is not IT technical skills. "
              "Return strict JSON: {\"companies\":[{\"name\":string,\"confidence\":number}]}. "
              "Only organisations; no people or job titles. Confidence in [0,1]. "
              "If none, return {\"companies\":[]}"
