@@ -78,9 +78,10 @@ def extract_company_llm(text: str) -> List[dict]:
              "Make sure that it is not IT technical skills. \n"
              "Please verify the organization/company names. recognize and briefly describe the organization as a real company/institution. \n"
              "Do not include any people or job titles. \n"
-             "If you are unsure or cannot describe the company, mark company_known=false else true. "
+             "If you are unsure or cannot describe the company, mark company_known='Not Sure' else 'Yes'. "
+             "if no companies found, mark company_known='No Company'. "
              "if no companies found, mark company_known empty. "
-             "Return strict JSON: {\"companies\":[{\"name\":string,\"confidence\":number}], \"company_known\":boolean}. "
+             "Return strict JSON: {\"companies\":[{\"name\":string,\"confidence\":number}], \"company_known\":string}. "
              "Only organisations; no people or job titles. Confidence in [0,1]. "
              "If none, return {\"companies\":[]}"
             },
@@ -381,7 +382,7 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
         return {"error": "Server not configured with DO agent base/key."}
     
     # 1) detect companies first
-    companies, needs_company_more_info = detect_companies_hybrid(body.message)
+    companies, company_is_known = detect_companies_hybrid(body.message)
     
     # 1.5) guard against companies (make sure valid company names):
     #if companies:
@@ -417,7 +418,7 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
     # already recruiter → skip further detection
         role = "recruiter_interviewer"
         role_conf = sess["state"].get("role_conf", 0.9)
-        policy_block = ROLE_POLICIES["recruiter_interviewer"]
+        #policy_block = ROLE_POLICIES["recruiter_interviewer"]
     else:
         role, role_conf, _signals = classify_role(
             body.message,
@@ -425,17 +426,18 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
             llm if USE_LLM_NER else None
         )
         update_role_state(sess, role, role_conf)
-        policy_block = ROLE_POLICIES["recruiter_interviewer"]
-      
-    print(companies, needs_company_more_info, role, role_conf)
+        #policy_block = ROLE_POLICIES["recruiter_interviewer"]
+    print('companies:', companies)
+    print('needs_company_more_info:', company_is_known)
+    print(companies, company_is_known, role, role_conf)
     # 3) If LLM couldn't recognize/describe any company, instruct it to ask user for details.
-    if len(companies)==0 and needs_company_more_info==True:
+    if len(companies)==0 and company_is_known=='Not Sure':
         body.message += (
-            "\n\nBefore proceeding, ask the user—in one concise question—to provide their company's "
+            "\n\n(Important to ask)Before proceeding, ask the user—in one concise question—to provide their company's "
             "full legal name, website or LinkedIn URL, and industry/location so you can tailor the answer. "
             "Do not suggest or guess any company names; just ask for details."
         )    
-    elif companies and needs_company_more_info==False:
+    elif companies and company_is_known=='Yes':
         ts = dt.datetime.utcnow().isoformat()
         alert_payload = _format_telegram_message(
             ts_iso=ts,
@@ -467,7 +469,7 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
             "user_message": body.message,
             "role": sess["state"]["role"],
             "companies": companies,
-            "needs_company_more_info": needs_company_more_info,
+            "needs_company_more_info": company_is_known,
             "summary": summary,
             "stage": sess["state"].get("flow_stage"),   # resume from last node
             "want_all_projects": False,
@@ -479,16 +481,14 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
         sess["state"]["flow_stage"] = flow_state.get("stage")
 
     
-    augmented_user_msg = policy_block + "\n\n" + memory_block + "\n"
+    #augmented_user_msg = policy_block + "\n\n" + memory_block + "\n"
+    #augmented_user_msg = policy_block + "\n\n" + memory_block + "\n"
+    body.message = f"(the user’s message is below here.)\\n\n{body.message}"
     if scripted:
-        augmented_user_msg += f"(Flow outline below)\n\n{scripted}\n\n"
-    augmented_user_msg += body.message
-        
-    # Prepend the scripted guidance (if any)
-    augmented_user_msg = policy_block + "\n\n" + memory_block + "\n"
-    if scripted:
-        augmented_user_msg += f"(Follow this outline; the user’s message is below.)\n\n{scripted}\n\n"
-    augmented_user_msg += body.message
+        guided_flow = f"(Follow this outline)\\n\n{scripted}\n\n"
+        augmented_user_msg = memory_block + "\n\n" + guided_flow + "\n" + body.message
+    else:
+        augmented_user_msg = memory_block + "\n\n" + body.message\
 
     
     # 4) forward to DO agent

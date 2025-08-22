@@ -100,7 +100,7 @@ def router(state: FlowState) -> str:
         return "END"
 
     # Need company info first?
-    if state.get("needs_company_more_info"):
+    if state.get("needs_company_more_info")=='Not Sure':
         # If we haven't asked yet this turn, go ask
         if state.get("stage") not in ("ask_company",):
             return "ask_company"
@@ -113,7 +113,7 @@ def router(state: FlowState) -> str:
     stage = state.get("stage")
     if stage in (None, "start"):
         # If we need company info, do that before showcase
-        if state.get("needs_company_more_info"):
+        if state.get("needs_company_more_info") == 'Not Sure':
             return "ask_company"
         # If user already asked for all projects, go directly there
         if requested_all:
