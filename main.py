@@ -75,8 +75,12 @@ def extract_company_llm(text: str) -> List[dict]:
         messages=[
             {"role":"system","content":
              "Extract organisation/company names mentioned by the user. \n"
-             "Make sure that it is not IT technical skills. "
-             "Return strict JSON: {\"companies\":[{\"name\":string,\"confidence\":number}]}. "
+             "Make sure that it is not IT technical skills. \n"
+             "Please verify the organization/company names. recognize and briefly describe the organization as a real company/institution. \n"
+             "Do not include any people or job titles. \n"
+             "If you are unsure or cannot describe the company, mark company_known=false else true. "
+             "if no companies found, mark company_known empty. "
+             "Return strict JSON: {\"companies\":[{\"name\":string,\"confidence\":number}], \"company_known\":boolean}. "
              "Only organisations; no people or job titles. Confidence in [0,1]. "
              "If none, return {\"companies\":[]}"
             },
@@ -90,18 +94,21 @@ def extract_company_llm(text: str) -> List[dict]:
     raw = (r.choices[0].message.content or "").strip()
     data = json.loads(raw)
     out = data.get("companies", [])
+    need_more_info = data.get("company_known", True)
     for c in out: c["method"] = "llm"
-    return out
+    return out, need_more_info
 
 def detect_companies_hybrid(text: str) -> List[dict]:
-    fast = extract_company_fuzzy_multi(text)
-    if fast:
-        return fast
-    try:
-        return extract_company_llm(text)
-    except Exception:
-        return fast
-
+    # fast = extract_company_fuzzy_multi(text)
+    # if fast:
+    #    return fast
+    #try:
+        #return extract_company_llm(text)
+    #except Exception:
+        #return fast
+        
+    return extract_company_llm(text)
+    
 # ---------- Telegram helpers ----------
 def _mdv2_escape(s: str) -> str:
     # Telegram MarkdownV2 requires escaping these characters
@@ -372,26 +379,26 @@ def redis_ping_rest():
 def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
     if not (DO_AGENT_BASE and DO_AGENT_KEY):
         return {"error": "Server not configured with DO agent base/key."}
-
+    
     # 1) detect companies first
-    companies = detect_companies_hybrid(body.message)
+    companies, needs_company_more_info = detect_companies_hybrid(body.message)
     
     # 1.5) guard against companies (make sure valid company names):
-    if companies:
-        llm_valdate_companies(companies)
+    #if companies:
+    #    llm_valdate_companies(companies)
         
     # 1.5) guard against companies (make sure valid/known company names via LLM):
-    needs_company_more_info = False
-    if companies:
+    #needs_company_more_info = False
+    #if companies:
         # Only check top 3 to keep latency sane
-        known_map = llm_valdate_companies(companies[:3])
+    #    known_map = llm_valdate_companies(companies[:3])
 
         # Keep only companies the LLM says it can recognize/describe
-        companies = [c for c in companies if known_map.get((c.get("name") or "").strip(), False)]
+    #    companies = [c for c in companies if known_map.get((c.get("name") or "").strip(), False)]
 
         # If nothing left after validation → ask user for more info (no names in the question)
-        if not companies:
-            needs_company_more_info = True    
+    #    if not companies:
+    #        needs_company_more_info = True    
     
     # 2) ---- Memory load & augment message ----
     session_id = body.session_id or "anon"
@@ -410,6 +417,7 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
     # already recruiter → skip further detection
         role = "recruiter_interviewer"
         role_conf = sess["state"].get("role_conf", 0.9)
+        policy_block = ROLE_POLICIES["recruiter_interviewer"]
     else:
         role, role_conf, _signals = classify_role(
             body.message,
@@ -417,18 +425,17 @@ def chat(body: ChatIn, request: Request, background_tasks: BackgroundTasks):
             llm if USE_LLM_NER else None
         )
         update_role_state(sess, role, role_conf)
-    
-    policy_block = ROLE_POLICIES.get(sess["state"]["role"], ROLE_POLICIES["general"])    
-
+        policy_block = ROLE_POLICIES["recruiter_interviewer"]
+      
+    print(companies, needs_company_more_info, role, role_conf)
     # 3) If LLM couldn't recognize/describe any company, instruct it to ask user for details.
-    if needs_company_more_info:
+    if len(companies)==0 and needs_company_more_info==True:
         body.message += (
             "\n\nBefore proceeding, ask the user—in one concise question—to provide their company's "
             "full legal name, website or LinkedIn URL, and industry/location so you can tailor the answer. "
             "Do not suggest or guess any company names; just ask for details."
-        )
-        
-    elif companies:
+        )    
+    elif companies and needs_company_more_info==False:
         ts = dt.datetime.utcnow().isoformat()
         alert_payload = _format_telegram_message(
             ts_iso=ts,
